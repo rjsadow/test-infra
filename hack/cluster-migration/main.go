@@ -61,9 +61,10 @@ type repoStatus struct {
 }
 
 type jobStatus struct {
-	JobName    string      `json:"jobName"`
-	JobDetails cfg.JobBase `json:"jobDetails"`
-	Eligible   bool        `json:"eligible"`
+	JobName          string      `json:"jobName"`
+	JobDetails       cfg.JobBase `json:"jobDetails"`
+	Eligible         bool        `json:"eligible"`
+	IneligibleReason []string    `json:"ineligibleReason"`
 }
 
 var config Config
@@ -158,6 +159,18 @@ func printClusterStat(clusterName string, stat clusterStatus, allStats []cluster
 	fmt.Printf(format, clusterName, stat.TotalJobs, printPercentage(totalP), printPercentage(eligibleP))
 }
 
+func printJson[T any](t T) {
+	bt, err := json.Marshal(t)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	json.Indent(&out, bt, "", " ")
+	out.WriteTo(os.Stdout)
+	println("\n")
+}
+
 // The function `getTotalEligible` calculates the total number of eligible jobs from a given list of
 // cluster statuses.
 func getTotalEligible(allStats []clusterStatus) int {
@@ -228,7 +241,7 @@ func getStatus(jobs map[string][]cfg.JobBase) status {
 	s := status{}
 	for repo, jobConfigs := range jobs {
 		for _, job := range jobConfigs {
-			cluster, eligible := getJobStatus(job)
+			cluster, eligible, reason := getJobStatus(job)
 			s.TotalJobs++
 			if cluster != "" && cluster != "default" {
 				s.CompletedJobs++
@@ -256,7 +269,7 @@ func getStatus(jobs map[string][]cfg.JobBase) status {
 							if eligible {
 								s.Clusters[i].RepoStatus[j].EligibleJobs++
 							}
-							s.Clusters[i].RepoStatus[j].Jobs = append(s.Clusters[i].RepoStatus[j].Jobs, jobStatus{JobName: job.Name, JobDetails: job, Eligible: eligible})
+							s.Clusters[i].RepoStatus[j].Jobs = append(s.Clusters[i].RepoStatus[j].Jobs, jobStatus{JobName: job.Name, JobDetails: job, Eligible: eligible, IneligibleReason: reason})
 						}
 					}
 				}
@@ -266,11 +279,12 @@ func getStatus(jobs map[string][]cfg.JobBase) status {
 	return s
 }
 
-func getJobStatus(job cfg.JobBase) (string, bool) {
+func getJobStatus(job cfg.JobBase) (string, bool, []string) {
 	if job.Cluster != "default" {
-		return job.Cluster, true
+		return job.Cluster, true, []string{}
 	}
-	return "", checkIfEligible(job)
+	eligible, reason := checkIfEligible(job)
+	return "", eligible, reason
 }
 
 func containsCluster(clusters []clusterStatus, cluster string) bool {
@@ -358,30 +372,42 @@ func printPercentage(f float64) string {
 // - The job's volumes must not contain any disallowed volumes. Volumes are considered disallowed if:
 //   - Their name contains the substring "cred".
 //   - They are of type Secret but their name is not in the list of allowed secret names.
-func checkIfEligible(job cfg.JobBase) bool {
+func checkIfEligible(job cfg.JobBase) (bool, []string) {
 	validClusters := []string{"test-infra-trusted", "k8s-infra-prow-build", "k8s-infra-prow-build-trusted", "eks-prow-build-cluster"}
+	eligible := true
+	reason := []string{}
 	if slices.Contains(validClusters, job.Cluster) {
-		return true
+		return eligible, reason
 	}
-	if containsDisallowedLabel(job.Labels) {
-		return false
+	if ok, r := containsDisallowedLabel(job.Labels); ok {
+		eligible = false
+		reason = append(reason, r...)
 	}
 	for _, container := range job.Spec.Containers {
-		if containsDisallowedAttributes(container) {
-			return false
+		if ok, r := containsDisallowedAttributes(container); ok {
+			eligible = false
+			reason = append(reason, r...)
 		}
+
 	}
-	return !containsDisallowedVolume(job.Spec.Volumes)
+	if ok, r := containsDisallowedVolume(job.Spec.Volumes); ok {
+		eligible = false
+		reason = append(reason, r...)
+	}
+	return eligible, reason
 }
 
 // The function checks if any label in a given map contains the substring "cred".
-func containsDisallowedLabel(labels map[string]string) bool {
+func containsDisallowedLabel(labels map[string]string) (bool, []string) {
+	var reason []string
+	disallowed := false
 	for key := range labels {
 		if checkContains(key, "cred") && !labelIsAllowed(key) {
-			return true
+			disallowed = true
+			reason = append(reason, fmt.Sprintf("Label %v contains disallowed substring", key))
 		}
 	}
-	return false
+	return disallowed, reason
 }
 
 func checkContains(s string, substring string) bool {
@@ -390,7 +416,7 @@ func checkContains(s string, substring string) bool {
 
 func labelIsAllowed(label string) bool {
 	for _, allowedLabel := range allowedLabelNames {
-		if checkContains(label, allowedLabel) {
+		if checkContains(allowedLabel, label) {
 			return true
 		}
 	}
@@ -426,27 +452,37 @@ func envVarIsAllowed(envVar string) bool {
 
 // The function checks if a container contains any disallowed attributes such as environment variables,
 // arguments, or commands.
-func containsDisallowedAttributes(container v1.Container) bool {
+func containsDisallowedAttributes(container v1.Container) (bool, []string) {
+	var reason []string
+	disallowed := false
 	for _, env := range container.Env {
 		if checkContains(env.Name, "cred") && !envVarIsAllowed(env.Name) {
-			return true
+			disallowed = true
+			reason = append(reason, fmt.Sprintf("Environment variable %v contains disallowed substring", env.Name))
 		}
 		if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil && !secretIsAllowed(env.ValueFrom.SecretKeyRef.Key) {
-			return true
+			disallowed = true
+			reason = append(reason, fmt.Sprintf("Environment variable %v is derived from a secret", env.Name))
 		}
 	}
 	disallowedArgs := []string{"gcloud", "gcp", "gce"}
 	for _, arg := range container.Args {
 		if containsAny(arg, disallowedArgs) {
-			return true
+			disallowed = true
+			reason = append(reason, fmt.Sprintf("Argument %v contains disallowed substring", arg))
 		}
 	}
 	for _, cmd := range container.Command {
 		if containsAny(cmd, disallowedArgs) {
-			return true
+			disallowed = true
+			reason = append(reason, fmt.Sprintf("Command %v contains disallowed substring", cmd))
 		}
 	}
-	return containsDisallowedVolumeMount(container.VolumeMounts)
+	if ok, r := containsDisallowedVolumeMount(container.VolumeMounts); ok {
+		disallowed = true
+		reason = append(reason, r...)
+	}
+	return disallowed, reason
 }
 
 // The function "containsAny" checks if a given string contains any of the words in a given slice of
@@ -462,25 +498,34 @@ func containsAny(s string, disallowed []string) bool {
 
 // The function checks if any volume mount in a given list contains disallowed words in its name or
 // mount path.
-func containsDisallowedVolumeMount(volumeMounts []v1.VolumeMount) bool {
+func containsDisallowedVolumeMount(volumeMounts []v1.VolumeMount) (bool, []string) {
+	var reason []string
+	disallowed := false
 	disallowedWords := []string{"cred", "secret"}
 	for _, vol := range volumeMounts {
 		if (containsAny(vol.Name, disallowedWords) || containsAny(vol.MountPath, disallowedWords)) && !volumeIsAllowed(vol.Name) {
-			return true
+			disallowed = true
+			reason = append(reason, fmt.Sprintf("Volume mount %v contains disallowed substring", vol.Name))
 		}
 	}
-	return false
+	return disallowed, reason
 }
 
 // The function checks if a list of volumes contains any disallowed volumes based on their name or if
 // they are of type Secret.
-func containsDisallowedVolume(volumes []v1.Volume) bool {
+func containsDisallowedVolume(volumes []v1.Volume) (bool, []string) {
+	var reason []string
+	disallowed := false
 	for _, vol := range volumes {
-		if (checkContains(vol.Name, "cred") && !volumeIsAllowed(vol.Name)) || (vol.Secret != nil && !secretIsAllowed(vol.Secret.SecretName)) {
-			return true
+		if checkContains(vol.Name, "cred") && !volumeIsAllowed(vol.Name) {
+			disallowed = true
+			reason = append(reason, fmt.Sprintf("Volume name %v is disallowed", vol.Name))
+		} else if vol.Secret != nil && !secretIsAllowed(vol.Secret.SecretName) {
+			disallowed = true
+			reason = append(reason, fmt.Sprintf("Volume %v is derived from an disallowed secret: %v", vol.Name, vol.Secret.SecretName))
 		}
 	}
-	return false
+	return disallowed, reason
 }
 
 func main() {
@@ -504,15 +549,7 @@ func main() {
 	status := getStatus(jobs)
 
 	if config.output == "json" {
-		bt, err := json.Marshal(status)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		var out bytes.Buffer
-		json.Indent(&out, bt, "", " ")
-		out.WriteTo(os.Stdout)
-		println("\n")
+		printJson(status)
 		return
 	}
 

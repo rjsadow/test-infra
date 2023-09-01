@@ -62,7 +62,7 @@ func TestGetJobStatus_NonDefaultCluster(t *testing.T) {
 		Cluster: "test-infra-trusted",
 	}
 
-	cluster, eligible := getJobStatus(job)
+	cluster, eligible, _ := getJobStatus(job)
 	if cluster != "test-infra-trusted" || !eligible {
 		t.Errorf("Expected cluster 'test-infra-trusted' and eligible true, got cluster '%s' and eligible %v", cluster, eligible)
 	}
@@ -523,9 +523,9 @@ func TestGetJobStatus_DefaultClusterEligible(t *testing.T) {
 	}
 
 	for _, job := range jobs {
-		cluster, eligible := getJobStatus(job.job)
+		cluster, eligible, reason := getJobStatus(job.job)
 		if cluster != job.expectedCluster || eligible != job.expectedEligible {
-			t.Errorf("%v: Expected cluster '%s' and eligible %v, got cluster '%s' and eligible %v", job.name, job.expectedCluster, job.expectedEligible, cluster, eligible)
+			t.Errorf("%v: Expected cluster '%s' and eligible %v, got cluster '%s' and eligible %v. Reason: %v", job.name, job.expectedCluster, job.expectedEligible, cluster, eligible, reason)
 		}
 	}
 }
